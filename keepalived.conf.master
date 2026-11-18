@@ -4,16 +4,34 @@ vrrp_script chk_pg {
     fall 2
     rise 2
 }
+vrrp_script chk_link {
+    script "/etc/ha/ha-link.sh"
+    interval 3
+    fall 2
+    rise 2
+}
 vrrp_instance VI_1 {
-    state BACKUP          # обе ноды BACKUP + nopreempt — VIP не скачет
+    state BACKUP          # ВАЖНО: обе ноды BACKUP, иначе nopreempt не работает
     interface eno1
-    virtual_router_id 77  # ДОЛЖЕН быть уникален в офисной сети! (51 — дефолт Mikrotik)
+    virtual_router_id 77
     priority 150
-    nopreempt
+    nopreempt             # не отжимать VIP у работающего мастера
     advert_int 1
-    authentication { auth_type PASS auth_pass HaVip26 }   # max 8 символов
-    virtual_ipaddress { 192.168.88.50/24 dev eno1 }
-    track_script { chk_pg }
+    unicast_src_ip 192.168.88.43
+    unicast_peer {
+        192.168.88.45
+    }
+    authentication {
+        auth_type PASS
+        auth_pass HaVip26
+    }
+    virtual_ipaddress {
+        192.168.88.50/24 dev eno1
+    }
+    track_script {
+        chk_pg
+        chk_link
+    }
     notify_master /etc/ha/become-master.sh
     notify_backup /etc/ha/become-backup.sh
 }

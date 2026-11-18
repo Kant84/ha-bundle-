@@ -1,22 +1,30 @@
 #!/bin/bash
-# Возврат отремонтированной ноды в строй как реплики текущего мастера (PEER_IP).
+# Возврат отремонтированной ноды в строй: пересоздание реплики с нуля через pg_basebackup.
+# Работает всегда — в отличие от pg_rewind, которому нужны data checksums / wal_log_hints,
+# включённые ДО расхождения. БД маленькая (десятки МБ), копия занимает секунды.
+# ВНИМАНИЕ: локальные данные ноды УНИЧТОЖАЮТСЯ и заменяются копией мастера (PEER_IP).
 set -e
 source /etc/ha/ha.env
 PGVER=16
 PGDATA=/var/lib/postgresql/$PGVER/main
-REWIND=/usr/lib/postgresql/$PGVER/bin/pg_rewind
 
 systemctl stop postgresql
 
-# rewind соединяется с мастером; pg_hba мастера должен разрешать репликацию с нас
 export PGPASSWORD=$PG_REPL_PASS
-sudo -E -u postgres $REWIND --target-pgdata=$PGDATA \
-    --source-server="host=$PEER_IP port=5432 user=replicator dbname=postgres" -R -P
+# Слот ha_slot на мастере: создать, если отсутствует
+sudo -E -u postgres psql -h $PEER_IP -U replicator -d postgres -tAc \
+  "select 1 from pg_replication_slots where slot_name='ha_slot'" | grep -q 1 || \
+sudo -E -u postgres psql -h $PEER_IP -U replicator -d postgres -c \
+  "select pg_create_physical_replication_slot('ha_slot');"
 
-# pg_rewind -R пишет primary_conninfo с user из source-server — выставляем явно
-sudo -u postgres psql -c "ALTER SYSTEM SET primary_conninfo = 'host=$PEER_IP port=5432 user=replicator password=$PG_REPL_PASS application_name=$(hostname)';" 2>/dev/null || true
+rm -rf $PGDATA
+sudo -E -u postgres pg_basebackup -h $PEER_IP -U replicator -D $PGDATA -P -R -X stream -S ha_slot
+
+# -R пишет primary_conninfo БЕЗ пароля — прописываем полный
+sudo -u postgres psql -c \
+  "ALTER SYSTEM SET primary_conninfo = 'host=$PEER_IP port=5432 user=replicator password=$PG_REPL_PASS application_name=$(hostname)';"
 
 systemctl start postgresql
-sleep 5
-sudo -u postgres psql -c "select pg_is_in_recovery();"   # ожидаем: t
-echo "Готово. Нода — реплика $PEER_IP. Убедись, что keepalived-priority этой ноды НИЗКИЙ."
+sleep 8
+sudo -u postgres psql -tAc "select pg_is_in_recovery();"   # ожидаем: t
+echo "Готово. Нода — реплика $PEER_IP."

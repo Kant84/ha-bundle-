@@ -1,395 +1,176 @@
-# ha-bundle v4 — отказоустойчивая пара серверов
+# HA Bundle v4 — Active/Passive кластер на keepalived + PostgreSQL 16
 
-Актив-пассивный кластер из двух машин: единый виртуальный IP (VRRP/keepalived),
-PostgreSQL 16 streaming replication, автоматический промоут при отказе,
-аппаратный STONITH через BliKVM (защита от split-brain). Слот под приложение (Docker Compose).
+Пара Ubuntu-серверов с единым виртуальным IP (VIP), PostgreSQL-репликацией и
+аппаратным STONITH через BliKVM. Боевой failover ≈ 20 секунд, без split-brain.
 
-**Проверено в бою:** убийство питания мастера → сервис восстановлен на второй ноде за ~20 секунд с теми же данными.
+![Архитектура](ha-cluster-architecture.png)
 
-```
-                    клиенты (приложение/мобильные)
-                            │
-                            ▼
-                    VIP: 192.168.88.50  ←─ единственный адрес для клиентов
-                            │
-        ┌───────────────────┴───────────────────┐
-        │                                       │
-   itconnect (MASTER)                     itconnect1 (BACKUP)
-   192.168.88.43                           192.168.88.45
-   PostgreSQL PRIMARY                      PostgreSQL REPLICA (always-on)
-   keepalived prio 150                   keepalived prio 100 (nopreempt)
-   приложение в /opt/app                  приложение остановлено
-        │                                       │
-   BliKVM №1 (.44)                        BliKVM №2 (.42)
-   ─ управляет itconnect1:                ─ управляет itconnect:
-     STONITH убивает .45                   STONITH убивает .43
-```
+## 1. Состав и адреса
 
-Роли MASTER/BACKUP после первого failover поменялись местами (мастером стал itconnect) —
-это нормально: `nopreempt` не даёт VIP прыгать обратно. Операционно роли равнозначны.
+| Устройство            | IP              | Роль |
+|-----------------------|-----------------|------|
+| itconnect (mobile)    | 192.168.88.43   | нода A: keepalived prio 150, PostgreSQL PRIMARY/REPLICA, слот приложения `/opt/app` |
+| itconnect1 (mobile1)  | 192.168.88.45   | нода B: keepalived prio 100 (nopreempt), PostgreSQL REPLICA/PRIMARY, слот приложения |
+| **VIP**               | **192.168.88.50** | единый адрес сервиса (живёт на текущем мастере; роли плавают после failover) |
+| BliKVM №1             | 192.168.88.44   | KVM-консоль + питание **ноды B** (itconnect1) |
+| BliKVM №2             | 192.168.88.42   | KVM-консоль + питание **ноды A** (itconnect) |
+| QNAP NAS (опционально)| по сети         | слой бэкапов: NFS `/mnt/backup-db`, см. раздел 8 |
 
----
+STONITH перекрёстный: каждая нода через свой BliKVM физически выключает соседа
+при получении роли мастера. Питание и консоль управляются по сети независимо от
+состояния самой ноды — это последняя линия защиты от split-brain.
 
-## 0. Требования
+## 2. Репозиторий → серверы (какой файл куда)
 
-| Что | Минимум |
-|---|---|
-| Серверы | 2 машины, Ubuntu 22.04/24.04, одна L2-сеть (офис) |
-| Сеть | Статические IP у обеих нод; VIP свободен в подсети |
-| BliKVM | По одному на каждый сервер (консоль + управление питанием) — иначе STONITH не работает |
-| Доступ | sudo на обеих нодах |
+| Файл репозитория         | Путь на сервере | Куда ставить |
+|--------------------------|-----------------|--------------|
+| `keepalived.conf.master` | `/etc/keepalived/keepalived.conf` | только .43 |
+| `keepalived.conf.backup` | `/etc/keepalived/keepalived.conf` | только .45 |
+| `ha.env.itconnect`       | `/etc/ha/ha.env` | только .43 |
+| `ha.env.itconnect1`      | `/etc/ha/ha.env` | только .45 |
+| `ha-check.sh`            | `/etc/ha/ha-check.sh` | обе, `chmod +x` |
+| `ha-link.sh`             | `/etc/ha/ha-link.sh`  | обе, `chmod +x` |
+| `become-master.sh`       | `/etc/ha/become-master.sh` | обе, `chmod +x` |
+| `become-backup.sh`       | `/etc/ha/become-backup.sh` | обе, `chmod +x` |
+| `reintegrate.sh`         | `/etc/ha/reintegrate.sh`   | обе, `chmod +x` |
+| `backup-nas.sh`          | `/etc/ha/backup-nas.sh` + cron | обе (раздел 8) |
 
-> ⚠️ VRID (77) должен быть уникален в сегменте. Узнать, кто уже шлёт VRRP:
-> `sudo tcpdump -ni eno1 vrrp -c 5` — если виден чужой vrid (напр. 51 от Mikrotik) — поменяйте `virtual_router_id` в обоих конфигах на уникальный.
+⚠️ **Файлы на серверы — только через `scp`/ssh-перенаправление. Вставка
+многострочного текста через веб-консоль BliKVM ("Paste text") теряет символы
+и строки** — так уже получены битые конфиги. Для локальной консоли включите
+поддержку мыши, длинные вставки разбивайте на короткие куски.
 
----
+## 3. Архитектура (как это работает)
 
-## 1. Установка с Git
+1. Клиенты ходят только на VIP `192.168.88.50`.
+2. keepalived (VRRP, **unicast**) держит VIP на мастере. Обе ноды в состоянии
+   BACKUP + `nopreempt`: VIP не отбирается у живого мастера более приоритетной
+   нодой. Трекинг двойной:
+   - `chk_pg` — локальный PostgreSQL отвечает (`pg_isready`);
+   - `chk_link` — карта `eno1` поднята И шлюз пингуется (изолированная нода
+     VIP не берёт).
+3. PostgreSQL 16: streaming-репликация always-on через слот `ha_slot`.
+   primary ровно один (проверка ниже).
+4. `notify_master` → `become-master.sh`: STONITH соседа через BliKVM +
+   подъём приложения из `/opt/app` (docker compose).
+5. `notify_backup` → `become-backup.sh`: остановка приложения.
 
-На **КАЖДОЙ** ноде:
-
-```bash
-sudo apt update && sudo apt install -y git
-cd /root && git clone https://github.com/Kant84/ha-bundle-.git
-cd ha-bundle-
-ls
-```
-
-**Ожидаемый вывод:**
-```
-become-backup.sh  become-master.sh  ha-check.sh
-ha.env.itconnect  ha.env.itconnect1
-keepalived.conf.backup  keepalived.conf.master
-pg-primary.sh  pg-replica.sh  reintegrate.sh  README.md
-```
-
-### Пакеты (обе ноды)
+## 4. Ежедневная проверка (2 минуты, с любой ноды)
 
 ```bash
-sudo apt install -y keepalived postgresql-16 docker.io docker-compose-v2
+ip a | grep 192.168.88.50                                # VIP есть ровно на одной ноде
+sudo -u postgres psql -tAc "select pg_is_in_recovery()"  # мастер: f | реплика: t
+sudo -u postgres psql -tAc "select count(*) from pg_stat_replication"  # мастер: 1
+ssh -i /root/.ssh/blikvm_stonith root@192.168.88.44 "echo STONITH_OK"    # STONITH .44
+ssh -i /root/.ssh/blikvm_stonith root@192.168.88.42 "echo STONITH_OK"    # STONITH .42
+ls -la /root/.ssh/ | grep -cE 'id_ed25519|id_rsa'        # ожидается >= 2 (ключи BliKVM)
+docker ps --format '{{.Names}}\t{{.Status}}'            # контейнеры — на ноде с VIP
 ```
 
-> Ubuntu 24.04: пакет называется `docker-compose-v2` (даёт `docker compose`).
-> Проверка: `docker compose version` → `Docker Compose version v2.x`.
+## 5. Failover
 
-**Ожидаемые маркеры:**
-```bash
-id postgres          # uid=110(postgres) ...
-systemctl status postgresql --no-pager | head -3   # active
-```
-
----
-
-## 2. Настройка ha.env (обе ноды, РАЗНЫЕ файлы)
-
-На каждой ноде свой файл — значения указывают на **соседа**:
+Происходит автоматически, когда текущий мастер перестаёт слать VRRP-анонсы
+(падение ноды, postgres, линка). Резерв берёт VIP за ~3–6 секунд, шлёт STONITH,
+поднимает приложение. **Боевой тест (только в окне обслуживания):**
 
 ```bash
-sudo mkdir -p /etc/ha /opt/app
-
-# на itconnect (192.168.88.43):
-sudo cp ~/ha-bundle-/ha.env.itconnect /etc/ha/ha.env
-
-# на itconnect1 (192.168.88.45):
-sudo cp ~/ha-bundle-/ha.env.itconnect1 /etc/ha/ha.env
+# с любой ноды: через BliKVM отключить питание ТЕКУЩЕГО мастера
+ssh -i /root/.ssh/blikvm_stonith root@$( [ "$(hostname)" = "mobile" ] && echo 192.168.88.42 || echo 192.168.88.44 ) "poweroff"
+ping 192.168.88.50     # пауза ~10–20 сек, затем ответы
+# данные на новом мастере целы; старый мастер потом вернуть через reintegrate.sh
 ```
 
-Отредактируй на каждой ноде: `sudo nano /etc/ha/ha.env`
+## 6. Реинтеграция (вернуть ноду в строй)
 
-| Параметр | itconnect (.43) | itconnect1 (.45) | Что это |
-|---|---|---|---|
-| `PEER_IP` | 192.168.88.45 | 192.168.88.43 | IP соседа (ping-проверка смерти) |
-| `BLIKVM_IP` | 192.168.88.44 | 192.168.88.42 | BliKVM, управляющий **соседом** |
-| `BLIKVM_PEER_MAC` | 40:b0:34:f5:6f:f0 | 18:60:24:fa:47:22 | MAC соседа (для magic-пакета) |
-| `PG_REPL_PASS` | одинаковый на обеих | одинаковый | пароль репликации |
-
-IP BliKVM смотри на его OLED-экранчике или: `sudo arp-scan --localnet | grep -i raspberry`.
-
-**Как понять, какой BliKVM чей** (без видео), с любой ноды:
-```bash
-for ip in <IP_BliKVM_1> <IP_BliKVM_2>; do
-  echo "== $ip =="; ssh root@$ip "hostname; grep -rh 'MAC=' /data/work 2>/dev/null | sort -u"
-done
-```
-MAC из вывода = MAC управляемой этим BliKVM машины.
-
----
-
-## 3. STONITH: ключи для аппаратного выключения соседа
-
-На **обеих** нодах:
+На отремонтированной ноде (она станет репликой текущего мастера):
 
 ```bash
-sudo ssh-keygen -t ed25519 -f /root/.ssh/blikvm_stonith -N ""
-sudo cat /root/.ssh/blikvm_stonith.pub
+sudo bash /etc/ha/reintegrate.sh
 ```
 
-Публичный ключ **каждой** ноды → в `~/.ssh/authorized_keys` **чужого** BliKVM:
+Скрипт останавливает postgres, при необходимости создаёт слот `ha_slot` на
+мастере, **пересоздаёт данные с нуля через `pg_basebackup`** (локальные данные
+ноды уничтожаются!), прописывает `primary_conninfo` со слотом и стартует
+реплику. Маркеры успеха: `t` и строка `Готово`.
+
+Почему не `pg_rewind`: кластер собран без data-checksums и раньше — без
+`wal_log_hints`, а rewind требует их **до** расхождения. Копия при объёме БД
+в десятки МБ занимает секунды, поэтому basebackup — надёжнее.
+
+## 7. Первичное развёртывание (если ноды чистые)
+
+1. Установить Ubuntu Server, сеть eno1, hostname mobile / mobile1, пароль nfc.
+2. На ОБЕИХ нодах, строго по очереди:
 
 ```bash
-# на itconnect1: ключ → BliKVM itconnect (.42)
-sudo cat /root/.ssh/blikvm_stonith.pub | ssh root@192.168.88.42 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
-# на itconnect: ключ → BliKVM itconnect1 (.44)
-sudo cat /root/.ssh/blikvm_stonith.pub | ssh root@192.168.88.44 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+mkdir -p /etc/ha
+# файлы из раздела 2 (каждый: chmod +x для *.sh)
+# PostgreSQL 16: установить, настроить по вспомогательным файлам
+#   pg_hba.conf: host replication replicator <peer>/32 scram-sha-256
+#                host postgres     replicator <peer>/32 scram-sha-256  (для reintegrate/rewind)
+#                host all          nfc        192.168.88.0/24 scram-sha-256
+# postgresql.conf/auto.conf: listen_addresses='localhost,<свой IP>'  (только с РЕСТАРТОМ)
+#                            wal_log_hints=on                        (только с РЕСТАРТОМ)
+#   роль: CREATE ROLE replicator LOGIN REPLICATION PASSWORD '***';
+#   пароль одинаковый на обеих нодах (= PG_REPL_PASS в ha.env)
+# слот на будущем мастере: SELECT pg_create_physical_replication_slot('ha_slot');
+# реплику на второй ноде поднять через reintegrate.sh
+# ssh-ключи: ssh-keygen; ssh-copy-id root@<BliKVM своего соседа> (см. deploy.md)
+sudo systemctl restart keepalived   # на каждой ноде после раскладки её конфига
 ```
 
-Проверка (обязательно без пароля):
+3. Применить unicast-переход на работающей паре — **только синхронно** (одной
+   командой, peer первым), иначе ноды перестанут слышать друг друга:
 
 ```bash
-# на itconnect1:
-sudo ssh -i /root/.ssh/blikvm_stonith -o BatchMode=yes -o StrictHostKeyChecking=no root@192.168.88.42 "echo STONITH_OK"
-# на itconnect:
-sudo ssh -i /root/.ssh/blikvm_stonith -o BatchMode=yes -o StrictHostKeyChecking=no root@192.168.88.44 "echo STONITH_OK"
+ssh nfc@<peer> "echo nfc | sudo -S systemctl reload keepalived" && echo nfc | sudo -S systemctl reload keepalived
 ```
 
-**Ожидаемый вывод (обе команды):** `STONITH_OK`
+## 8. Бэкапы на NAS (QNAP)
 
----
-
-## 4. PostgreSQL: мастер → реплика
-
-Сначала мастер, потом реплика.
-
-### 4.1 На будущем мастере (itconnect1, .45) при первичной установке:
+Поверх HA-кластера — файл-сервер с RAID 1 (2×8 ТБ), NFS (SMB выключен),
+фиксированный IP, монтирование `_netdev`:
 
 ```bash
-sudo bash ~/ha-bundle-/pg-primary.sh
+# /etc/fstab на обеих нодах:
+# <nas-ip>:/backup-db  /mnt/backup-db  nfs  defaults,_netdev  0 0
+sudo mkdir -p /mnt/backup-db && sudo mount -a
 ```
 
-**Ожидаемый вывод:**
-```
- pg_is_in_recovery
--------------------
- f
-(1 row)
-pg-primary: готово. ...
-```
-(скрипт идемпотентен — повторный запуск не портит конфиг)
-
-### 4.2 На будущей реплике (itconnect, .43):
+Cron (на обеих; скрипт сам делает дамп только на primary):
 
 ```bash
-sudo bash ~/ha-bundle-/pg-replica.sh
+echo '30 3 * * * root /etc/ha/backup-nas.sh >> /var/log/backup-nas.log 2>&1' | sudo tee /etc/cron.d/backup-nas
 ```
 
-**Ожидаемый вывод:** прогресс `pg_basebackup` до 100%, затем:
-```
- pg_is_in_recovery
--------------------
- t
-(1 row)
-REPLICA готова, источник: 192.168.88.45
-```
+Правило: NAS — второй экземпляр данных, но в одном офисе; для катастрофической
+защиты периодически копировать дамп наружу (облако).
 
-### 4.3 Проверка репликации (на мастере)
+## 9. Известные грабли (проверено ночью инцидента)
 
-```bash
-sudo -u postgres psql -c "select client_addr, state from pg_stat_replication;"
-sudo -u postgres psql -c "select slot_name, active from pg_replication_slots;"
-```
+1. `ha-check.sh` не должен проверять `pg_is_in_recovery()` — реплика в вечном
+   FAULT и failover не случается никогда (баг v3, исправлено в v4).
+2. `listen_addresses`/`wal_log_hints` применяются **только рестартом**
+   postgres. Параметр прописан, но не применён = обратная репликация молча
+   не работает.
+3. `pg_basebackup -R` не сохраняет пароль в `primary_conninfo` — реплика не
+   коннектится; reintegrate.sh дописывает.
+4. Слот `ha_slot` живёт на текущем primary; после смены мастера его надо
+   пересоздавать (reintegrate.sh делает сам).
+5. BliKVM "Paste text" портит многострочные вставки — конфиги только scp/ssh.
+6. Unicast-VRRP: обе ноды должны перейти синхронно, иначе элекция сорвётся.
+7. `keepalived.conf`: обе ноды `state BACKUP`, иначе `nopreempt` не работает.
+8. Приоритеты в файлах не перепутать: `.43`=150 (master-файл), `.45`=100.
 
-**Ожидаемый вывод:**
-```
-  client_addr  |   state
----------------+-----------
- 192.168.88.43 | streaming        ← IP реплики
+## 10. Changelog
 
- slot_name | active
------------+--------
- ha_slot   | t
-```
-
----
-
-## 5. Скрипты HA + keepalived
-
-На **обеих** нодах:
-
-```bash
-sudo cp ~/ha-bundle-/ha-check.sh ~/ha-bundle-/become-master.sh ~/ha-bundle-/become-backup.sh /etc/ha/
-sudo chmod +x /etc/ha/*.sh
-bash -n /etc/ha/ha-check.sh && bash -n /etc/ha/become-master.sh && bash -n /etc/ha/become-backup.sh && echo SYNTAX_OK
-```
-**Ожидаемо:** `SYNTAX_OK`
-
-keepalived по роли:
-
-```bash
-# на itconnect1 (master-роль, prio 150):
-sudo cp ~/ha-bundle-/keepalived.conf.master /etc/keepalived/keepalived.conf
-# на itconnect (backup-роль, prio 100):
-sudo cp ~/ha-bundle-/keepalived.conf.backup /etc/keepalived/keepalived.conf
-
-# на обеих:
-sudo systemctl enable --now keepalived
-```
-
-### Проверка VIP
-
-```bash
-# на мастере:
-ip a | grep 192.168.88.50
-journalctl -u keepalived --no-pager | grep -i entering | tail -3
-```
-**Ожидаемо на мастере:**
-```
-    inet 192.168.88.50/24 scope global secondary eno1
-(VI_1) Entering MASTER STATE
-```
-**Ожидаемо на backup:** `Entering BACKUP STATE`, VIP в `ip a` отсутствует.
-
----
-
-## 6. Слот приложения
-
-Положи `docker-compose.yml` своего backend в `/opt/app` **на обеих** нодах.
-Требования к приложению: слушать `0.0.0.0`, подключаться к БД на `127.0.0.1`.
-keepalived сам поднимет его на мастере (`become-master.sh`) и остановит на backup.
-
----
-
-## 7. ТЕСТИРОВАНИЕ (обязательный блок)
-
-Перед каждым тестом: `ping 192.168.88.50` с третьей машины (ноутбук) — терминал рядом.
-
-### Тест 1. Софт-сбой: падение PostgreSQL на мастере
-
-```bash
-# на мастере:
-sudo systemctl stop postgresql
-```
-**Ожидаемо:** через ~6 сек `journalctl -u keepalived` на мастере: `(VI_1) Entering FAULT STATE`,
-VIP исчезает на мастере, через ~10–15 сек появляется на backup; `pg_is_in_recovery()` на backup → `f` (авто-промоут).
-**Восстановление после теста:**
-```bash
-# на бывшем мастере — сначала реинтеграция (он теперь "отставший"):
-sudo bash ~/ha-bundle-/reintegrate.sh   # ожидаем: t + streaming в pg_stat_replication
-# VIP останется на новом мастере (nopreempt) — это нормально
-```
-
-### Тест 2. ЖЁСТКИЙ ОТКАЗ: выключение питания мастера через BliKVM
-
-Цель: проверить весь боевой цикл — STONITH, промоут, переезд VIP за секунды.
-
-**Подготовка:**
-1. Записать тестовые данные на мастере, чтобы проверить их сохранность:
-```bash
-# на мастере:
-sudo -u postgres psql -c "create table if not exists ha_test(v text);"
-sudo -u postgres psql -c "insert into ha_test values ('FAILOVER_TEST_' || now());"
-sudo -u postgres psql -c "select * from ha_test order by 1 desc limit 3;"
-```
-2. На ноутбуке: `ping 192.168.88.50 -t`
-3. Открыть веб-морду **BliKVM мастера** (если мастер = itconnect, то BliKVM .44)
-
-**Удар:**
-4. В веб-морде BliKVM → жёстко выключить питание сервера (Power → OFF).
-   Машина мгновенно мёртва — никакого штатного завершения.
-
-**Наблюдение (на ноутбуке):** ping прервётся на ~10–20 секунд → вернётся.
-
-**Проверка на выжившей ноде (сразу после возврата ping):**
-
-```bash
-ip a | grep 192.168.88.50
-```
-**Ожидаемо:** `inet 192.168.88.50/24 ...` ← **VIP переехал**
-
-```bash
-sudo -u postgres psql -c "select pg_is_in_recovery();"
-```
-**Ожидаемо:** `f` ← реплика промоутилась, данные уехали
-
-```bash
-sudo -u postgres psql -c "select * from ha_test order by 1 desc limit 3;"
-```
-**Ожидаемо:** строка `FAILOVER_TEST_...` с временем до убийства ← **данные не потеряны**
-
-```bash
-journalctl -t ha -n 20 --no-pager
-```
-**Ожидаемо (последовательность):**
-```
-STONITH: poweroff peer via BliKVM ... (peer=...)
-promoting postgres
-node is now MASTER, VIP should be here
-```
-
-```bash
-journalctl -u keepalived --no-pager | grep -i entering | tail -4
-```
-**Ожидаемо:** `BACKUP STATE` → `MASTER STATE`
-
-**Все пять пунктов = failover работает.** ✅
-
-### Тест 3. Возврат убитой ноды (реинтеграция)
-
-⚠ **НЕ включай убитую ноду просто так** — на ней старый PRIMARY, включение = split-brain.
-
-1. Включи питание через BliKVM (Power → ON), дай загрузиться (~1–2 мин)
-2. На восстановленной ноде:
-```bash
-sudo bash ~/ha-bundle-/reintegrate.sh
-```
-**Ожидаемый вывод:**
-```
-pg_rewind: connected to server
-pg_rewind: servers diverged at WAL location ...
-pg_rewind: Done!
- pg_is_in_recovery
--------------------
- t
-Готово. Нода — реплика ...
-```
-3. На мастере:
-```bash
-sudo -u postgres psql -c "select client_addr, state from pg_stat_replication;"
-```
-**Ожидаемо:** `192.168.88.X | streaming` — нода вернулась как реплика
-
-4. Восстановленная нода остаётся BACKUP (VIP не отбирает — nopreempt). VIP живёт там, где был поднят после отказа. Это штатно.
-
-### Тест 4. Сеть (опционально): выдернуть кабель мастера
-
-Эмулирует обрыв линка: поведение = как Тест 2, но STONITH пройдёт через ping-проверку
-(пир не отвечает → промоут разрешён). Вернуть кабель → на «старом» мастере: `bash reintegrate.sh`.
-
----
-
-## 8. Если что-то пошло не так
-
-| Симптом | Причина | Лечение |
-|---|---|---|
-| `No VIP specified` в журнале | Кривой конфиг (скобки/CRLF) | `cat -A /etc/keepalived/keepalived.conf`, исправить, restart |
-| Обе ноды BACKUP, VIP ни у кого | Остался «фантомный мастер» со сломанным конфигом, nopreempt молчит | Починить конфиг на обеих, `systemctl restart keepalived` на обеих |
-| Реплика не стартует: `max_wal_senders ... lower setting` | Реплика требует ≥ значения мастера | `sudo sed -i 's/^max_wal_senders = .*/max_wal_senders = 10/' /etc/postgresql/16/main/postgresql.conf` + restart |
-| `FATAL: no pg_hba.conf entry for replication` | Нет строки репликации для пира | добавить `host replication replicator <PEER_IP>/32 scram-sha-256` на мастере, reload |
-| После failover обе ноды `f` (два PRIMARY) | **split-brain!** Бывший мастер включили до rewind | Немедленно `sudo systemctl stop postgresql` на той, что должна быть репликой → `reintegrate.sh` |
-| `pg_rewind: command not found` | Нет в PATH | полный путь: `/usr/lib/postgresql/16/bin/pg_rewind` (в скрипте уже) |
-| VIP не переезжает при убийстве питания | backup в FAULT | проверить `sudo /etc/ha/ha-check.sh; echo $?` → должно быть 0 (pg_isready) |
-
----
-
-## 9. Памятка по граблям (все выловлены на практике)
-
-1. **VRID уникален** в сегменте (51 — дефолт Mikrotik; у нас 77). Проверка: `sudo tcpdump -ni eno1 vrrp -c 5`
-2. **`nopreempt` работает только при `state BACKUP` на обеих**
-3. **`auth_pass` ≤ 8 символов**
-4. **`listen_addresses = '*'`** — переживает смену ролей; доступ всё равно режет pg_hba
-5. **Health-check только `pg_isready`** — проверка роли убивает failover (backup всегда в recovery → вечный FAULT)
-6. **`max_wal_senders = 10`** ≥ дефолта апстрима, иначе реплика не стартует
-7. **`notify_backup` вызывается и при старте keepalived** — guard через `/run/ha-was-master` (в скрипте)
-8. **Никогда не `systemctl start postgresql` на бывшем мастере до `pg_rewind`** — split-brain
-9. `pg_rewind -R` пишет `primary_conninfo` с user из `--source-server` — reintegrate.sh переписывает его правильно (replicator + пароль)
-
----
-
-## 10. Быстрая сверка здоровья (ежедневно)
-
-```bash
-# на любой ноде:
-ip a | grep 192.168.88.50          # где VIP — тот и мастер
-sudo -u postgres psql -c "select pg_is_in_recovery();"   # мастер: f, реплика: t
-sudo -u postgres psql -c "select client_addr, state from pg_stat_replication;"  # streaming
-systemctl is-active keepalived postgresql                # active active
-```
+- **v4 (2026-11-19)**: unicast VRRP вместо multicast; новый `chk_link`
+  (`ha-link.sh`); `ha-check.sh` без проверки роли (фикс вечного FAULT);
+  `reintegrate.sh` переведён на `pg_basebackup`; добавлен `backup-nas.sh`;
+  требование `wal_log_hints=on` и LAN в `listen_addresses`; pg_hba дополнен
+  строками `host postgres replicator <peer>/32`; README переписан.
+- **v3**: текущая боевое ядро (keepalived+STONITH+PG-репликация), баг с
+  `pg_is_in_recovery` в `ha-check.sh` исправлен только в репозитории, не на
+  серверах.
+- **v2**: добавлен STONITH через BliKVM.
+- **v1**: keepalived + ручной failover.
