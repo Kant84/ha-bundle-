@@ -20,9 +20,13 @@ sudo -E -u postgres psql -h $PEER_IP -U replicator -d postgres -c \
 rm -rf $PGDATA
 sudo -E -u postgres pg_basebackup -h $PEER_IP -U replicator -D $PGDATA -P -R -X stream -S ha_slot
 
-# -R пишет primary_conninfo БЕЗ пароля — прописываем полный
-sudo -u postgres psql -c \
-  "ALTER SYSTEM SET primary_conninfo = 'host=$PEER_IP port=5432 user=replicator password=$PG_REPL_PASS application_name=$(hostname)';"
+# -R пишет primary_conninfo БЕЗ пароля, а ALTER SYSTEM недоступен при остановленном
+# postgres — дописываем полный primary_conninfo напрямую в postgresql.auto.conf
+# (последняя строка с параметром побеждает).
+CONF=$PGDATA/postgresql.auto.conf
+sudo sed -i "/^primary_conninfo\s*=/d" "$CONF"
+echo "primary_conninfo = 'host=$PEER_IP port=5432 user=replicator password=$PG_REPL_PASS application_name=$(hostname)'" | \
+  sudo tee -a "$CONF" >/dev/null
 
 systemctl start postgresql
 sleep 8
