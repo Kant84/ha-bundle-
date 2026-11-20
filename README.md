@@ -163,7 +163,10 @@ echo '30 3 * * * root /etc/ha/backup-nas.sh >> /var/log/backup-nas.log 2>&1' | s
 8. Приоритеты в файлах не перепутать: `.43`=150 (master-файл), `.45`=100.
 
 ## 10. Changelog
-
+- **v5.1 (2026-11-20)**: добавлен раздел 11 «Хроника инцидентов и лечение» 
+  (9 разборов: FAULT v3, рассинхрон VRRP, WOL-STONITH, pg_rewind, 
+  listen_addresses/wal_log_hints без рестарта, пароль в primary_conninfo, слот 
+  ha_slot, «чужой» listen_addresses после basebackup, WOL/BIOS-процедуры).
 - **v4 (2026-11-19)**: unicast VRRP вместо multicast; новый `chk_link`
   (`ha-link.sh`); `ha-check.sh` без проверки роли (фикс вечного FAULT);
   `reintegrate.sh` переведён на `pg_basebackup`; добавлен `backup-nas.sh`;
