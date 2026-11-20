@@ -162,6 +162,148 @@ echo '30 3 * * * root /etc/ha/backup-nas.sh >> /var/log/backup-nas.log 2>&1' | s
 7. `keepalived.conf`: обе ноды `state BACKUP`, иначе `nopreempt` не работает.
 8. Приоритеты в файлах не перепутать: `.43`=150 (master-файл), `.45`=100.
 
+## 11. Хроника инцидентов (18–20 ноября 2026) и их лечение
+
+Каждый пункт: симптом → как нашли → корневая причина → лечение → контроль.
+Раздел писан по реальным ночным инцидентам, все пункты проверены боевыми тестами.
+
+### 11.1 Вечный FAULT реплики (баг v3)
+
+- **Симптом:** мастер убит, backup не берёт VIP никогда; в журнале
+  `VRRP_Script(chk_pg) failed`.
+- **Диагностика:** `cat /etc/ha/ha-check.sh` на сервере — файл отличался от
+  репозитория.
+- **Причина:** старая версия `ha-check.sh` проверяла `pg_is_in_recovery()`.
+  Реплика ВСЕГДА в recovery → скрипт всегда возвращает 1 → keepalived держит
+  ноду в FAULT. Исправление существовало в репозитории, но на серверы не было
+  задеплоено.
+- **Лечение:** `ha-check.sh` v4 — только `pg_isready` (жив = здоров).
+- **Контроль:** на backup-ноде `/etc/ha/ha-check.sh; echo $?` → `0`.
+
+### 11.2 Рассинхрон VRRP: VIP исчез везде
+
+- **Симптом:** после правки конфигов `ip a | grep 88.50` пусто на ОБЕИХ нодах,
+  сервис недоступен.
+- **Диагностика:** журналы keepalived: ноды не видят чужих анонсов.
+- **Причина:** одна нода переведена на `unicast_peer`, вторая осталась на
+  multicast → ноды физически не слышат друг друга. Усугублялось: веб-вставка
+  конфига через консоль BliKVM теряла строки (блок `chk_link` пропал,
+  `keepalived -t` ругался «unknown keyword», но файл всё равно был установлен
+  цепочкой `&&`).
+- **Лечение:** обе ноды на unicast; переход — СИНХРОННЫМ reload одной командой
+  (peer первым), иначе окно рассинхрона; перед установкой файла — обязательная
+  проверка (`grep -c`, `keepalived -t`).
+- **Контроль:** `sudo tcpdump -i eno1 -nn vrrp -c 4` — только пары
+  `.43 ↔ .45`, никакого `224.0.0.18`.
+
+### 11.3 «STONITH» через WOL — не работал по построению
+
+- **Симптом:** при промоуте в логе `STONITH: poweroff peer...`, а нода пир
+  продолжает работать.
+- **Диагностика:** чтение `become-master.sh`: «STONITH» слал magic packet (WOL).
+- **Причина:** WOL умеет только ВКЛЮЧАТЬ машину, выключить работающую не может.
+  Аппаратной альтернативы нет: у HP-нод нет подключённого ATX-провода к BliKVM,
+  кнопку питания через BliKVM нажать нельзя (`POST /api/v1/atx/power
+  {"action":"off"}` отвечает `ok`, но ничего не выключает).
+- **Лечение (v5):** STONITH = SSH к пиру ключом `/root/.ssh/stonith_off_key`
+  (root→nfc) с командой `sudo poweroff`. Плюс существующий ping-guard: пир
+  пингуется → промоут запрещён (защита от split-brain на случай, если выключение
+  не сработало). WOL сохранён только для включения нод после обслуживания.
+- **Контроль:** боевой тест: `sudo ssh -i /root/.ssh/stonith_off_key
+  nfc@<peer> "echo nfc | sudo -S poweroff"` → пир гаснет; ping-guard:
+  `ping -c2 <peer>` после «неудачного» STONITH блокирует промоут.
+
+### 11.4 pg_rewind неприменим на этом кластере
+
+- **Симптом:** `reintegrate.sh` (старая, на pg_rewind) падает с
+  `target server needs to use either data checksums or "wal_log_hints = on"`.
+- **Причина:** кластер инициализирован без data-checksums, `wal_log_hints`
+  был выключен (и должен быть включён ДО расхождения, задним числом не лечится).
+- **Лечение:** reintegrate.sh v4+ переписан на `pg_basebackup` (полная копия за
+  секунды — БД десятки МБ). Заодно включён `wal_log_hints=on` (см. 11.5).
+- **Контроль:** `sudo bash /etc/ha/reintegrate.sh` → 100% → `t` → `Готово`.
+
+### 11.5 «Прописано ≠ работает»: listen_addresses и wal_log_hints
+
+- **Симптом:** реплика стримит в одну сторону; в обратную — `Connection
+  refused` по LAN-IP мастера, хотя «всё настроено».
+- **Причина:** параметры применяются ТОЛЬКО рестартом postgres. Значение было
+  прописано в `postgresql.auto.conf` неделями ранее, но postgres с тех пор не
+  перезапускался → слушал только `localhost`. Та же история с `wal_log_hints`.
+- **Лечение:** после изменения таких параметров — обязательно
+  `systemctl restart postgresql` и сверка `ss -ltn | grep 5432` (должен быть
+  виден `192.168.88.<свой IP>:5432`).
+- **Контроль:** с пира: `pg_isready -h 192.168.88.<peer>` → accepting connections.
+
+### 11.6 pg_basebackup -R не сохраняет пароль; ALTER SYSTEM на мёртвом кластере
+
+- **Симптом:** после reintegrate реплика не коннектится: в логе postgres
+  `FATAL: password authentication failed for user "replicator"`. Второй
+  вариант: скрипт падает после basebackup на `ALTER SYSTEM` (postgres остановлен)
+  и БД не стартует вообще.
+- **Причина:** (а) `-R` пишет `primary_conninfo` без пароля; (б) `ALTER SYSTEM`
+  требует работающего сервера, а в сценарии reintegrate он остановлен; под
+  `set -e` скрипт умирал до `systemctl start`.
+- **Лечение (v5.1):** `primary_conninfo` дописывается напрямую в
+  `postgresql.auto.conf` (`sed` удаляет старую строку, `tee -a` добавляет
+  полную — последняя строка побеждает).
+- **Контроль:** после reintegrate: `select status from pg_stat_wal_receiver` →
+  `streaming`; на мастере `select count(*) from pg_stat_replication` → `1`.
+
+### 11.7 Слот репликации живёт на текущем primary
+
+- **Симптом:** walreceiver: `replication slot "ha_slot" does not exist` после
+  смены мастера.
+- **Причина:** физический слот существует на primary, куда писалась реплика;
+  после failover он остаётся на старом месте, а не «переезжает».
+- **Лечение:** reintegrate.sh сам создаёт слот на текущем мастере, если его нет
+  (`pg_create_physical_replication_slot('ha_slot')`).
+- **Контроль:** на мастере `select slot_name from pg_replication_slots` →
+  `ha_slot` есть; `pg_stat_replication.state` → `streaming`.
+
+### 11.8 listen_addresses «кочует» вместе с репликой
+
+- **Симптом:** reintegrate проходит на ноде X, а потом обратный reintegrate
+  падает с Connection refused на уже леченную настройку.
+- **Причина:** `pg_basebackup` копирует `postgresql.auto.conf` ДОНОРА целиком —
+  включая `listen_addresses` с IP донора. Каждая пересборка реплики приносит
+  «чужой» IP слушания.
+- **Лечение:** процедура возврата ноды дополнена шагом: после reintegrate на
+  ВОЗВРАЩАЕМОЙ ноде проверить и выставить свой IP:
+  `ALTER SYSTEM SET listen_addresses = 'localhost,<свой IP>';` +
+  `systemctl restart postgresql` + `ss -ltn | grep 5432`.
+- **Контроль:** `pg_isready -h <свой IP>` → accepting connections.
+
+### 11.9 Удалённое включение ноды: WOL
+
+- **Симптом:** нода выключена, magic packet с другого сервера не будит.
+- **Что выяснили:** рабочий рецепт — `wol.sh` (BliKVM управляющего устройства):
+  кнопка ▶ в веб-интерфейсе. Пакеты, посланные с сервера `.45`, в одном из
+  тестов не дошли (зафиксировано; причина не установлена — используем BliKVM
+  как источник WOL). BIOS HP обязан иметь: **S5 Maximum Power Savings =
+  Disabled** (он обесточивает NIC в выключенном состоянии), **Wake On LAN =
+  Boot to Hard Drive** (Advanced → Built-In Device Options), **After Power Loss
+  = Power On** (Advanced → Boot Options — авто-включение после сбоя электричества),
+  **Startup Delay = 10 сек** (окно для входа в BIOS по сети).
+- **Вход в BIOS удалённо без ловли тайминга:** машина загружается в UEFI →
+  `sudo systemctl reboot --firmware-setup` — следующая загрузка сразу в BIOS
+  Setup. (Макросы BliKVM с серией F9/Esc через «Макросы» — запасной вариант.)
+
+### 11.10 Права и доступы, без которых реинтеграция не работает
+
+- pg_hba на КАЖДОЙ ноде (пригодится при любой смене мастера):
+  `host replication replicator <peer>/32 scram-sha-256` (стриминг) И
+  `host postgres replicator <peer>/32 scram-sha-256` (pg_basebackup/pg_rewind
+  ходят в базу postgres).
+- Роль: `CREATE ROLE replicator LOGIN REPLICATION PASSWORD '...';` — пароль
+  одинаковый на обеих нодах (= `PG_REPL_PASS` в ha.env).
+- Для pg_rewind-подобных операций: `GRANT pg_read_server_files` (на кластере без
+  checksums всё равно не спасает — см. 11.4).
+- Ключи: `stonith_off_key` (root→nfc, оба направления) — STONITH v5;
+  `blikvm_stonith` (root→root на BliKVM) — проверка/сервис.
+- Скрипт `reboot.sh` на BliKVM — SSH-based (dropbear-ключ к nfc@хост): работает
+  только на ВКЛЮЧЕННОЙ машине; `exit 1` на выключенной — норма, не ошибка.
+
 ## 10. Changelog
 - **v5.1 (2026-11-20)**: добавлен раздел 11 «Хроника инцидентов и лечение» 
   (9 разборов: FAULT v3, рассинхрон VRRP, WOL-STONITH, pg_rewind, 
